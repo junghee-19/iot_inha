@@ -8,22 +8,26 @@ if (!globalThis.crypto) {
 }
 
 export default defineConfig(({ mode }) => {
-    const env = loadEnv(mode, '.', '');
-    return {
-      server: {
-        port: 3000,
-        host: '0.0.0.0',
+  const env = loadEnv(mode, '.', '');
+  return {
+    plugins: [react()],
+    server: {
+      proxy: {
+        '/api': {
+          target: 'http://localhost:4000', // FastAPI 서버
+          changeOrigin: true,
+        },
       },
-      plugins: [react()],
-      define: {
-        'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY)
+    },
+    define: {
+      'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+    },
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, '.'),
+        '@assets': path.resolve(__dirname, './assets'),
       },
-      resolve: {
-        alias: {
-          '@': path.resolve(__dirname, '.'),
-          '@assets': path.resolve(__dirname, './assets'),
-        }
-      }
-    };
+    },
+  };
 });

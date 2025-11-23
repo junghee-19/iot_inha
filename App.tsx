@@ -7,6 +7,8 @@ import type { BuildingName } from './types';
 import { SparkleIcon } from './components/Icons';
 import { fetchCurrentBuilding } from './services/buildingFeed';
 import './index.css';
+import AiAssistant from './components/AiAssistant';
+
 type SensorStatus = 'idle' | 'syncing' | 'live' | 'waiting' | 'error';
 const POLL_INTERVAL_MS = 3000;
 
@@ -37,7 +39,7 @@ const App: React.FC = () => {
         setSensorError(null);
 
         if (result.buildingName) {
-          setActiveBuilding(result.buildingName);
+          setActiveBuilding(result.buildingName as BuildingName);
           setSensorStatus('live');
           setLastTouchedAt(result.touchedAt || new Date().toISOString());
         } else {
@@ -45,10 +47,7 @@ const App: React.FC = () => {
         }
       } catch (error) {
         if (!isMounted) return;
-        if (
-          error instanceof DOMException &&
-          error.name === 'AbortError'
-        ) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
           return;
         }
         setSensorStatus('error');
@@ -64,7 +63,6 @@ const App: React.FC = () => {
       controller?.abort();
       window.clearInterval(intervalId);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -92,10 +90,12 @@ const App: React.FC = () => {
             )}
           </div>
         </div>
+
         <Navigation
           activeBuilding={activeBuilding}
           setActiveBuilding={setActiveBuilding}
         />
+
         <main className="mt-10">
           {selectedBuildingData ? (
             <BuildingInfo building={selectedBuildingData} />
@@ -106,9 +106,17 @@ const App: React.FC = () => {
           )}
         </main>
       </div>
-       <footer className="fixed bottom-0 right-0 p-8 z-10 pointer-events-none">
-         <SparkleIcon className="w-16 h-16 text-gray-800" />
-      </footer>
+
+      {/* AI 어시스턴트는 화면 전체에 떠있는 버튼/패널이니까 바깥에 두는 게 자연스러움 */}
+      <AiAssistant
+        buildingId={selectedBuildingData?.id ?? null}
+        buildingName={selectedBuildingData?.name ?? null}
+        context={
+          selectedBuildingData
+            ? `현재 선택된 건물: ${selectedBuildingData.name}`
+            : null
+        }
+      />
     </div>
   );
 };
