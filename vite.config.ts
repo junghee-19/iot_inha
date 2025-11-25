@@ -14,7 +14,7 @@ export default defineConfig(({ mode }) => {
     server: {
       proxy: {
         '/api': {
-          target: 'http://localhost:4000', // FastAPI 서버
+          target: 'http://localhost:5001', // FastAPI 서버
           changeOrigin: true,
         },
       },
