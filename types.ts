@@ -19,7 +19,7 @@ export interface FloorPlanLabel {
 }
 
 export interface Building {
-  id: number;
+  id: string;
   name: BuildingName;
   image: string;
   floorPlanLabels: FloorPlanLabel[];

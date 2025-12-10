@@ -453,7 +453,7 @@ export const buildingImages: Record<string, string> = {
 export const BUILDING_DATA: Building[] = BUILDING_NAMES.map((name, index) => {
     const floors = buildingFloors[name as BuildingName] || [];
     return {
-        id: index + 1,
+        id: "B" + (index),
         name: name as BuildingName,
         image: buildingImages[name as BuildingName],
         floorPlanLabels: generateFloorPlanLabels(floors, customFloorPlanImages[name as BuildingName]),

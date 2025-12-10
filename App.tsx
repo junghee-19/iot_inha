@@ -6,6 +6,7 @@ import { BUILDING_DATA, BUILDING_NAMES } from './constants';
 import type { BuildingName } from './types';
 import { SparkleIcon } from './components/Icons';
 import { fetchCurrentBuilding } from './services/buildingFeed';
+import { BACKEND_URL, CRAWL_API_URL } from './config';
 import './index.css';
 import AiAssistant from './components/AiAssistant';
 
@@ -17,6 +18,8 @@ const App: React.FC = () => {
   const [sensorStatus, setSensorStatus] = useState<SensorStatus>('idle');
   const [sensorError, setSensorError] = useState<string | null>(null);
   const [lastTouchedAt, setLastTouchedAt] = useState<string | null>(null);
+  const [crawlStatus, setCrawlStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [crawlMessage, setCrawlMessage] = useState<string | null>(null);
 
   const selectedBuildingData = useMemo(() => {
     return BUILDING_DATA.find(building => building.name === activeBuilding);
@@ -65,8 +68,61 @@ const App: React.FC = () => {
     };
   }, []);
 
+  const triggerCrawl = async () => {
+    const payload = {
+      buildingId: String(selectedBuildingData?.id ?? 'B0'),
+      buildingName: selectedBuildingData?.name ?? '본관',
+      url: 'https://www.inhatc.ac.kr/kr/451/subview.do',
+      replaceExisting: true,
+    };
+
+    setCrawlStatus('loading');
+    setCrawlMessage(null);
+
+    try {
+      const res = await fetch(`${CRAWL_API_URL}/api/admin/crawl-building-faq`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(`크롤링 실패 (status: ${res.status}): ${data?.detail ?? '서버 오류'}`);
+      }
+      const count = data?.faqCount ?? 0;
+      setCrawlStatus('success');
+      setCrawlMessage(`크롤링 완료: FAQ ${count}건 저장`);
+    } catch (err: any) {
+      setCrawlStatus('error');
+      setCrawlMessage(err?.message ?? '크롤링 중 오류가 발생했습니다.');
+    }
+  };
+
   return (
     <div className="bg-white min-h-screen">
+      {/* 관리자용: FAQ 크롤링 트리거 버튼 */}
+      <div className="fixed top-4 right-4 z-50 flex flex-col items-end gap-2">
+        <button
+          type="button"
+          onClick={triggerCrawl}
+          disabled={crawlStatus === 'loading'}
+          className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-4 py-2 text-sm font-semibold text-white shadow-lg hover:bg-slate-800 disabled:opacity-60 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-500"
+        >
+          <SparkleIcon className="w-4 h-4" />
+          {crawlStatus === 'loading' ? '크롤링 중...' : 'FAQ 크롤링'}
+        </button>
+        {crawlMessage && (
+          <span
+            className={`text-xs ${
+              crawlStatus === 'error' ? 'text-red-500' : 'text-slate-700'
+            } bg-white/90 rounded-lg px-3 py-2 shadow`}
+          >
+            {crawlMessage}
+          </span>
+        )}
+      </div>
+
       <div className="max-w-6xl mx-auto px-6 py-10 relative">
         <Header />
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 bg-gray-50 border border-gray-200 rounded-2xl px-5 py-4">

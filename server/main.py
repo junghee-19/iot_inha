@@ -1,20 +1,31 @@
 # main.py
 import os
+import json
 from typing import List, Optional
 from datetime import datetime
 
+import requests
 import pymysql
 from pymysql.cursors import DictCursor
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
+from bs4 import BeautifulSoup
+import urllib3
 
-# ----- 환경 변수 & 클라이언트 설정 -----
-# 상위 폴더(../.env)에 있는 환경변수 로드
+# ----- 환경 변수 & Ollama(OpenAI 호환) 클라이언트 설정 -----
+# 상위 폴더(../.env)에 있는 환경변수 로드 (DB 설정 등에 사용)
 load_dotenv(dotenv_path="../.env")
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Ollama 서버(OpenAI 호환 /v1 엔드포인트 사용)
+# OLLAMA_BASE_URL은 필요 시 .env에 넣어서 변경 가능
+client = OpenAI(
+    base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1"),
+    api_key=os.getenv("OPENAI_API_KEY", "ollama"),  # 형식상 필요, 실제로는 무시됨
+)
+
 
 # ----- FastAPI 앱 구성 -----
 app = FastAPI()
@@ -30,7 +41,7 @@ async def get_current_building():
     # TODO: 여기에서 실제 센서/DB 값 읽어오도록 나중에 교체
     return CurrentBuildingResponse(
         buildingName=None,  # 혹은 "1호관" 같은 기본값
-        touchedAt=datetime.utcnow().isoformat()
+        touchedAt=datetime.utcnow().isoformat(),
     )
 
 
@@ -57,7 +68,186 @@ def connect_db():
     )
 
 
-# ----- Pydantic 모델 -----
+# ----- 크롤링 기반 FAQ 생성: 요청 모델 & 유틸 -----
+class CrawlBuildingFaqRequest(BaseModel):
+    buildingId: str           # buildings.id (varchar)
+    buildingName: Optional[str] = None  # UI에서 보여줄 이름 (선택)
+    url: str                  # 크롤링할 페이지 URL
+    replaceExisting: bool = True  # 기존 FAQ를 지우고 다시 채울지 여부
+
+
+def fetch_html(url: str) -> str:
+    """주어진 URL에서 HTML을 가져온다. SSL 오류 시 한번 더 검증 없이 시도."""
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        return resp.text
+    except requests.exceptions.SSLError as e:
+        # 내부망/구형 TLS 이슈 대비: verify=False 로 재시도 (경고 억제)
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        try:
+            resp = requests.get(url, timeout=10, verify=False)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as e2:
+            # https -> http 강제 다운그레이드 시도
+            if url.startswith("https://"):
+                downgraded = "http://" + url[len("https://") :]
+                try:
+                    resp = requests.get(downgraded, timeout=10)
+                    resp.raise_for_status()
+                    return resp.text
+                except Exception as e3:
+                    print(f"[ERROR] fetch_html({url}) http fallback 실패: {e3!r}")
+                    raise HTTPException(status_code=502, detail=f"HTML fetch error (SSL/http): {e3}")
+            print(f"[ERROR] fetch_html({url}) SSL fallback 실패: {e2!r}")
+            raise HTTPException(status_code=502, detail=f"HTML fetch error (SSL): {e2}")
+    except requests.exceptions.RequestException as e:
+        # 기타 연결 오류에서도 https였다면 http로 한번 강제 시도
+        if url.startswith("https://"):
+            downgraded = "http://" + url[len("https://") :]
+            try:
+                resp = requests.get(downgraded, timeout=10)
+                resp.raise_for_status()
+                return resp.text
+            except Exception as e3:
+                print(f"[ERROR] fetch_html({url}) http fallback 실패: {e3!r}")
+                raise HTTPException(status_code=502, detail=f"HTML fetch error (http fallback): {e3}")
+        print(f"[ERROR] fetch_html({url}) 실패: {e!r}")
+        raise HTTPException(status_code=502, detail=f"HTML fetch error: {e}")
+    except Exception as e:
+        print(f"[ERROR] fetch_html({url}) 실패: {e!r}")
+        raise HTTPException(status_code=502, detail=f"HTML fetch error: {e}")
+
+
+def html_to_text(html: str) -> str:
+    """HTML에서 불필요한 태그를 제거하고 순수 텍스트만 추출한다."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header"]):
+        tag.decompose()
+
+    text = soup.get_text(separator="\n")
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    return "\n".join(lines)
+
+
+def llm_extract_faqs_from_page(
+    building_id: str,
+    building_name: Optional[str],
+    url: str,
+    page_text: str,
+) -> List[dict]:
+    """
+    LLM에게 페이지 텍스트를 전달해 FAQ 목록을 뽑는다.
+    반환 형식: [{ "question": "...", "answer": "..." }, ...]
+    """
+    system_prompt = """
+당신은 한국 대학 캠퍼스의 건물 안내 및 행정 안내 FAQ를 만드는 어시스턴트입니다.
+
+입력으로 웹페이지의 전체 텍스트와 건물 이름, URL이 주어집니다.
+이 페이지를 읽고, 학생들이 자주 물어볼 법한 질문과 그에 대한 답변을 뽑아서
+FAQ 항목들로 만들어 주세요.
+
+반드시 아래 JSON 형식으로만 출력하세요:
+
+{
+  "faqs": [
+    { "question": "질문1", "answer": "답변1" },
+    { "question": "질문2", "answer": "답변2" }
+  ]
+}
+
+규칙:
+- 문서에 명시된 정보만 사용하고, 문서에 없는 내용을 상상해서 만들지 마세요.
+- 질문은 한국어로, 짧고 명확하게 표현합니다.
+- 답변은 해당 건물이나 관련 부서 기준으로, 한두 문단 안에서 정리합니다.
+- FAQ가 만들기 애매하면 빈 배열 faqs: [] 를 반환해도 됩니다.
+""".strip()
+
+    user_prompt = f"""
+[건물 ID]
+{building_id}
+
+[건물 이름]
+{building_name or "알 수 없음"}
+
+[페이지 URL]
+{url}
+
+[페이지 전체 텍스트]
+{page_text}
+""".strip()
+
+    completion = client.chat.completions.create(
+        model=os.getenv("LLM_MODEL"),  # 로컬에 pull된 모델명으로 설정
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+        response_format={"type": "json_object"},
+    )
+
+    content = completion.choices[0].message.content
+    try:
+        data = json.loads(content)
+    except Exception as e:
+        print("LLM JSON 파싱 실패:", content)
+        raise HTTPException(status_code=500, detail=f"LLM JSON parse error: {e}")
+
+    faqs = data.get("faqs") or []
+    clean_faqs = []
+    for item in faqs:
+        q = (item.get("question") or "").strip()
+        a = (item.get("answer") or "").strip()
+        if q and a:
+            clean_faqs.append({"question": q, "answer": a})
+
+    return clean_faqs
+
+
+def save_building_faqs(building_id: str, faqs: List[dict], replace_existing: bool = True):
+    """building_faq 테이블에 FAQ 목록을 저장한다."""
+    if not faqs:
+        print(f"[INFO] building_id={building_id} 에 저장할 FAQ 없음")
+        return
+
+    conn = connect_db()
+    try:
+        with conn.cursor() as cur:
+            # FK 존재 여부 확인
+            cur.execute("SELECT id FROM buildings WHERE id = %s", (building_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"building_id '{building_id}' 가 buildings 테이블에 없습니다.",
+                )
+
+            if replace_existing:
+                cur.execute(
+                    "DELETE FROM building_faq WHERE building_id = %s",
+                    (building_id,),
+                )
+                print(f"[INFO] building_faq 기존 데이터 삭제 building_id={building_id}")
+
+            for item in faqs:
+                cur.execute(
+                    """
+                    INSERT INTO building_faq (building_id, question, answer)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (building_id, item["question"], item["answer"]),
+                )
+
+            conn.commit()
+            print(f"[OK py] building_id={building_id} 에 FAQ {len(faqs)}개 저장 완료")
+    finally:
+        conn.close()
+
+
+# ----- Pydantic 모델 (일반 AI 답변) -----
 class BuildingAIRequest(BaseModel):
     question: str
     # 건물 화면에서 쓰면 넘겨주고, 캠퍼스 전체 질문이면 null
@@ -127,14 +317,35 @@ def search_keyword_all_buildings(user_question: str, limit: int = 10):
         conn.close()
 
 
-# ----- GPT 호출을 포함한 메인 엔드포인트 -----
+# ----- 엔드포인트: 관리자 크롤링 → FAQ 자동 생성 -----
+@app.post("/api/admin/crawl-building-faq")
+async def crawl_building_faq(req: CrawlBuildingFaqRequest):
+    """
+    프론트엔드 '불러오기' 버튼에서 호출.
+    - 페이지 HTML 크롤링 → 텍스트 변환
+    - LLM으로 FAQ 추출
+    - building_faq 테이블에 저장
+    """
+    html = fetch_html(req.url)
+    page_text = html_to_text(html)
+    faqs = llm_extract_faqs_from_page(
+        building_id=req.buildingId,
+        building_name=req.buildingName,
+        url=req.url,
+        page_text=page_text,
+    )
+    save_building_faqs(req.buildingId, faqs, replace_existing=req.replaceExisting)
+    return {"buildingId": req.buildingId, "faqCount": len(faqs)}
+
+
+# ----- Ollama(Llama 등) 호출을 포함한 메인 엔드포인트 (기존 기능) -----
 @app.post("/api/building-ai", response_model=BuildingAIResponse)
 async def building_ai(req: BuildingAIRequest):
     """
     - buildingId 가 있으면: 해당 건물 안에서 우선 FAQ/키워드 검색
     - 해당 건물에서 못 찾으면: 캠퍼스 전체에서 키워드 검색 (fallback)
     - buildingId 가 없으면: 처음부터 캠퍼스 전체에서 키워드 검색
-    - 그 결과(knowledge)를 GPT에게 넘겨서 자연스럽게 답변 생성
+    - 그 결과(knowledge)를 LLM에게 넘겨서 자연스럽게 답변 생성
     """
     building_id: Optional[str] = None
     if req.buildingId is not None:
@@ -155,8 +366,7 @@ async def building_ai(req: BuildingAIRequest):
                 }
             )
 
-    # 🔥 2) 해당 건물에서 아무것도 못 찾았거나 buildingId 자체가 없는 경우:
-    #     캠퍼스 전체에서 검색 (fallback / global 검색)
+    # 2) 해당 건물에서 못 찾았거나 buildingId 가 없는 경우: 캠퍼스 전체 검색
     if not knowledge_items:
         matches = search_keyword_all_buildings(req.question, limit=10)
         for row in matches:
@@ -183,7 +393,7 @@ async def building_ai(req: BuildingAIRequest):
     else:
         knowledge_block = "지식 없음"
 
-    # 4) GPT 프롬프트 구성
+    # 4) 프롬프트 구성
     user_prompt = f"""
 너는 대학교 캠퍼스 건물 안내 도우미야.
 
@@ -208,8 +418,9 @@ async def building_ai(req: BuildingAIRequest):
 4. '~호관에 ~가 있습니다' 형태를 사용하면 좋다.
     """.strip()
 
+    # 🔥 Ollama(OpenAI 호환 /v1/chat/completions) 호출
     completion = client.chat.completions.create(
-        model="gpt-4.1-mini",  # 필요하면 다른 모델로 변경
+        model= os.getenv("LLM_MODEL"),  # ← Ollama에 pull 해둔 모델 이름으로 변경
         messages=[
             {
                 "role": "system",

@@ -14,7 +14,8 @@ export default defineConfig(({ mode }) => {
     server: {
       proxy: {
         '/api': {
-          target: 'http://localhost:5001', // FastAPI 서버
+          // FastAPI dev 서버 포트와 일치시킨다 (uvicorn 기본 8000)
+          target: 'http://localhost:8000',
           changeOrigin: true,
         },
       },
