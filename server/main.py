@@ -258,6 +258,9 @@ class BuildingAIRequest(BaseModel):
 
 class BuildingAIResponse(BaseModel):
     answer: str
+    recommendedBuildingId: Optional[str] = None
+    recommendedBuildingHoNumber: Optional[str] = None
+    recommendedBuildingName: Optional[str] = None
 
 
 # ----- 키워드 검색 함수들 -----
@@ -299,6 +302,7 @@ def search_keyword_all_buildings(user_question: str, limit: int = 10):
             cur.execute(
                 """
                 SELECT
+                  b.id,
                   b.ho_number,
                   b.name AS building_name,
                   f.question AS keyword,
@@ -352,6 +356,9 @@ async def building_ai(req: BuildingAIRequest):
         building_id = str(req.buildingId)
 
     knowledge_items: List[dict] = []
+    recommended_building_id: Optional[str] = None
+    recommended_building_ho: Optional[str] = None
+    recommended_building_name: Optional[str] = None
 
     # 1) buildingId 있는 경우: 해당 건물 스코프에서 먼저 검색
     if building_id:
@@ -363,8 +370,16 @@ async def building_ai(req: BuildingAIRequest):
                     "building_label": req.buildingName or "해당 건물",
                     "keyword": row["question"],
                     "answer": row["answer"],
+                    "building_id": building_id,
+                    "ho_number": None,
+                    "building_name": req.buildingName,
                 }
             )
+        if rows:
+            recommended_building_id = building_id
+            recommended_building_name = req.buildingName
+            if req.buildingName and ("호관" in req.buildingName or req.buildingName == "본관"):
+                recommended_building_ho = req.buildingName
 
     # 2) 해당 건물에서 못 찾았거나 buildingId 가 없는 경우: 캠퍼스 전체 검색
     if not knowledge_items:
@@ -377,8 +392,23 @@ async def building_ai(req: BuildingAIRequest):
                     "building_label": label,
                     "keyword": row["keyword"],
                     "answer": row["answer"],
+                    "building_id": row.get("id"),
+                    "ho_number": row.get("ho_number"),
+                    "building_name": row.get("building_name"),
                 }
             )
+        if matches and recommended_building_id is None:
+            recommended_building_id = (
+                str(matches[0].get("id"))
+                if matches[0].get("id") is not None
+                else None
+            )
+            recommended_building_ho = (
+                str(matches[0].get("ho_number"))
+                if matches[0].get("ho_number") is not None
+                else None
+            )
+            recommended_building_name = matches[0].get("building_name")
 
     # 3) knowledge_items 를 텍스트 블록으로 변환
     if knowledge_items:
@@ -432,4 +462,13 @@ async def building_ai(req: BuildingAIRequest):
     )
 
     answer = completion.choices[0].message.content
-    return BuildingAIResponse(answer=answer)
+    return BuildingAIResponse(
+        answer=answer,
+        recommendedBuildingId=str(recommended_building_id)
+        if recommended_building_id is not None
+        else None,
+        recommendedBuildingHoNumber=str(recommended_building_ho)
+        if recommended_building_ho is not None
+        else None,
+        recommendedBuildingName=recommended_building_name,
+    )

@@ -172,6 +172,7 @@ const App: React.FC = () => {
             ? `현재 선택된 건물: ${selectedBuildingData.name}`
             : null
         }
+        onSelectBuilding={(building) => setActiveBuilding(building)}
       />
     </div>
   );

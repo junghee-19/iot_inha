@@ -1,14 +1,18 @@
 import React, {
-    useState,
-    useRef,
-    useEffect,
-    FormEvent,
-  } from 'react';
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  FormEvent,
+} from 'react';
+import type { BuildingName } from '../types';
+import { BUILDING_NAMES } from '../constants';
   
   interface AiAssistantProps {
     buildingId?: string | number | null;
     buildingName?: string | null;
     context?: string | null;
+    onSelectBuilding?: (building: BuildingName) => void;
   }
   
   type ChatMessage = {
@@ -16,20 +20,65 @@ import React, {
     role: 'user' | 'assistant';
     content: string;
   };
+
+  type BuildingAIResponse = {
+    answer: string;
+    recommendedBuildingId?: string | null;
+    recommendedBuildingHoNumber?: string | null;
+    recommendedBuildingName?: string | null;
+  };
+
+  // 웹 음성 인식/합성 관련 타입 최소 정의
+  type SpeechRecognitionLike = {
+    lang: string;
+    continuous: boolean;
+    interimResults: boolean;
+    start: () => void;
+    stop: () => void;
+    abort?: () => void;
+    onstart: (() => void) | null;
+    onend: (() => void) | null;
+    onerror: ((event: { error?: string; message?: string }) => void) | null;
+    onresult: ((event: { results: { [index: number]: { 0: { transcript: string } } } }) => void) | null;
+  };
+
+  type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+  const resolveBuildingNameFromHo = (value?: string | null): BuildingName | null => {
+    if (!value) return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const candidate = trimmed.includes('호관') ? trimmed : `${trimmed}호관`;
+    if (BUILDING_NAMES.includes(candidate as BuildingName)) {
+      return candidate as BuildingName;
+    }
+    if (candidate === '본관' && BUILDING_NAMES.includes('본관' as BuildingName)) {
+      return '본관';
+    }
+    return null;
+  };
   
-  const AiAssistant: React.FC<AiAssistantProps> = ({
-    buildingId = null,
-    buildingName = null,
-    context = null,
-  }) => {
+const AiAssistant: React.FC<AiAssistantProps> = ({
+  buildingId = null,
+  buildingName = null,
+  context = null,
+  onSelectBuilding,
+}) => {
     const [isOpen, setIsOpen] = useState(false);
     const [question, setQuestion] = useState('');
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [isSpeechSupported, setIsSpeechSupported] = useState(false);
+    const [isListening, setIsListening] = useState(false);
+    const [isSpeaking, setIsSpeaking] = useState(false);
+    const [listenError, setListenError] = useState<string | null>(null);
+    const [ttsEnabled, setTtsEnabled] = useState(true);
   
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const messagesEndRef = useRef<HTMLDivElement | null>(null);
+    const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+    const isSendingRef = useRef(false);
   
     // textarea 자동 높이 조절
     useEffect(() => {
@@ -54,62 +103,164 @@ import React, {
       window.addEventListener('keydown', onKeyDown);
       return () => window.removeEventListener('keydown', onKeyDown);
     }, [isOpen]);
+
+    const speakText = useCallback(
+      (text: string) => {
+        if (!ttsEnabled) return;
+        if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+        if (!text.trim()) return;
+
+        window.speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.lang = 'ko-KR';
+        utter.rate = 1;
+        utter.pitch = 1;
+        utter.onstart = () => setIsSpeaking(true);
+        utter.onend = () => setIsSpeaking(false);
+        utter.onerror = () => setIsSpeaking(false);
+        window.speechSynthesis.speak(utter);
+      },
+      [ttsEnabled],
+    );
+
+    const sendQuestion = useCallback(
+      async (userContent: string, source: 'text' | 'voice' = 'text') => {
+        if (isSendingRef.current) return;
+        const trimmed = userContent.trim();
+        if (!trimmed) return;
+
+        setError(null);
+        setIsLoading(true);
+        isSendingRef.current = true;
+
+        const newUserMessage: ChatMessage = {
+          id: `user-${Date.now()}`,
+          role: 'user',
+          content: trimmed,
+        };
+
+        setMessages((prev) => [...prev, newUserMessage]);
+
+        try {
+          const res = await fetch('/api/building-ai', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              question: trimmed,
+              buildingId,
+              buildingName,
+              context,
+              source,
+            }),
+          });
+
+          if (!res.ok) {
+            throw new Error(`서버 오류가 발생했습니다. (status: ${res.status})`);
+          }
+
+          const data = (await res.json()) as BuildingAIResponse;
+          const answerText: string =
+            data?.answer ?? '답변을 가져오지 못했습니다.';
+
+          const newAssistantMessage: ChatMessage = {
+            id: `assistant-${Date.now()}`,
+            role: 'assistant',
+            content: answerText,
+          };
+
+          setMessages((prev) => [...prev, newAssistantMessage]);
+          speakText(answerText);
+          const targetBuilding =
+            resolveBuildingNameFromHo(data?.recommendedBuildingHoNumber ?? null) ||
+            resolveBuildingNameFromHo(data?.recommendedBuildingName ?? null);
+          if (targetBuilding && onSelectBuilding) {
+            onSelectBuilding(targetBuilding);
+          }
+        } catch (err: any) {
+          setError(err?.message ?? '요청 중 오류가 발생했습니다.');
+        } finally {
+          setIsLoading(false);
+          isSendingRef.current = false;
+        }
+      },
+      [buildingId, buildingName, context, onSelectBuilding, speakText],
+    );
+
+    // 웹 음성 인식 초기화
+    useEffect(() => {
+      const SpeechRec = (window as any).SpeechRecognition ||
+        (window as any).webkitSpeechRecognition as SpeechRecognitionConstructor | undefined;
+
+      if (!SpeechRec) {
+        setIsSpeechSupported(false);
+        return;
+      }
+
+      const recognition = new SpeechRec();
+      recognition.lang = 'ko-KR';
+      recognition.continuous = false;
+      recognition.interimResults = false;
+
+      recognition.onstart = () => {
+        setIsListening(true);
+        setListenError(null);
+      };
+      recognition.onend = () => setIsListening(false);
+      recognition.onerror = (event) => {
+        setIsListening(false);
+        setListenError(event?.error ?? '음성 인식 중 오류가 발생했습니다.');
+      };
+      recognition.onresult = (event) => {
+        const transcript = event?.results?.[0]?.[0]?.transcript?.trim();
+        if (!transcript) return;
+        setQuestion(transcript);
+        sendQuestion(transcript, 'voice');
+      };
+
+      recognitionRef.current = recognition;
+      setIsSpeechSupported(true);
+
+      return () => {
+        recognition.onstart = null;
+        recognition.onend = null;
+        recognition.onresult = null;
+        recognition.onerror = null;
+        recognition.stop?.();
+      };
+    }, [sendQuestion]);
+
+    const startListening = () => {
+      if (!isSpeechSupported || !recognitionRef.current) return;
+      if (isSpeaking) window.speechSynthesis?.cancel?.();
+      setListenError(null);
+      setIsListening(true); // 토글 시 즉시 on 상태로 전환해 중복 start 방지
+      try {
+        recognitionRef.current.start();
+      } catch (err) {
+        setIsListening(false);
+        setListenError('마이크를 시작할 수 없습니다. 새로고침 후 다시 시도해 주세요.');
+      }
+    };
+
+    const stopListening = () => {
+      const rec = recognitionRef.current;
+      if (!rec) return;
+      try {
+        rec.stop?.();
+        rec.abort?.(); // start 대기/중복 호출 대비
+      } catch {
+        // ignore
+      } finally {
+        setIsListening(false);
+      }
+    };
   
     const handleSubmit = async (e: FormEvent) => {
       e.preventDefault();
       if (!question.trim() || isLoading) return;
-  
       const userContent = question.trim();
-  
-      // 입력창 비우기 먼저
       setQuestion('');
-      setError(null);
-      setIsLoading(true);
-  
-      const newUserMessage: ChatMessage = {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        content: userContent,
-      };
-  
-      // 1) 사용자 메시지를 히스토리에 추가
-      setMessages((prev) => [...prev, newUserMessage]);
-  
-      try {
-        const res = await fetch('/api/building-ai', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            question: userContent,
-            buildingId,
-            buildingName,
-            context,
-            // 지금은 서버에 이전 히스토리는 안 보내지만,
-            // 나중에 필요하면 messages도 같이 보낼 수 있음
-          }),
-        });
-  
-        if (!res.ok) {
-          throw new Error(`서버 오류가 발생했습니다. (status: ${res.status})`);
-        }
-  
-        const data = await res.json();
-        const answerText: string =
-          data.answer ?? '답변을 가져오지 못했습니다.';
-  
-        const newAssistantMessage: ChatMessage = {
-          id: `assistant-${Date.now()}`,
-          role: 'assistant',
-          content: answerText,
-        };
-  
-        // 2) GPT 답변도 히스토리에 추가
-        setMessages((prev) => [...prev, newAssistantMessage]);
-      } catch (err: any) {
-        setError(err.message ?? '요청 중 오류가 발생했습니다.');
-      } finally {
-        setIsLoading(false);
-      }
+      await sendQuestion(userContent, 'text');
     };
   
     return (
@@ -239,6 +390,29 @@ import React, {
                       />
                     </div>
                     <button
+                      type="button"
+                      aria-label="음성 인식 시작/중지"
+                      onClick={isListening ? stopListening : startListening}
+                      disabled={!isSpeechSupported}
+                      className={`inline-flex h-9 w-9 items-center justify-center rounded-full ${
+                        isListening
+                          ? 'bg-emerald-600 text-white'
+                          : 'bg-gray-200 text-gray-700'
+                      } disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-slate-500`}
+                    >
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="18"
+                        height="18"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          fill="currentColor"
+                          d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm-7-3a1 1 0 0 1 2 0 5 5 0 0 0 10 0 1 1 0 1 1 2 0 7 7 0 0 1-6 6.93V21a1 1 0 1 1-2 0v-2.07A7 7 0 0 1 5 12Z"
+                        />
+                      </svg>
+                    </button>
+                    <button
                       type="submit"
                       aria-label="질문 전송"
                       aria-disabled={isLoading || !question.trim()}
@@ -264,6 +438,47 @@ import React, {
                       {error}
                     </p>
                   )}
+                  {listenError && (
+                    <p className="mt-1 text-[11px] text-red-500">
+                      {listenError}
+                    </p>
+                  )}
+                  <div className="mt-1 flex items-center justify-between text-[11px] text-gray-500">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 ${
+                          isListening
+                            ? 'bg-emerald-50 text-emerald-700'
+                            : 'bg-gray-100 text-gray-600'
+                        }`}
+                      >
+                        <span className={`w-2 h-2 rounded-full ${isListening ? 'bg-emerald-500' : 'bg-gray-400'}`} />
+                        {isSpeechSupported
+                          ? isListening
+                            ? '듣는 중'
+                            : '대기 중'
+                          : '음성 인식 미지원'}
+                      </span>
+                      <span
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 ${
+                          isSpeaking
+                            ? 'bg-indigo-50 text-indigo-700'
+                            : 'bg-gray-100 text-gray-600'
+                        }`}
+                      >
+                        <span className={`w-2 h-2 rounded-full ${isSpeaking ? 'bg-indigo-500' : 'bg-gray-400'}`} />
+                        {isSpeaking ? '말하는 중' : 'TTS 대기'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setTtsEnabled((prev) => !prev)}
+                      className="inline-flex items-center gap-1 rounded-full px-2 py-1 bg-gray-100 text-gray-600 hover:bg-gray-200 focus:outline-none focus:ring-1 focus:ring-slate-500"
+                    >
+                      <span className={`w-2 h-2 rounded-full ${ttsEnabled ? 'bg-emerald-500' : 'bg-gray-400'}`} />
+                      {ttsEnabled ? 'TTS 켜짐' : 'TTS 꺼짐'}
+                    </button>
+                  </div>
                 </form>
   
                 {/* 푸터 안내 */}
